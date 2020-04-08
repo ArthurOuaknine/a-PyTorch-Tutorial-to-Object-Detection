@@ -17,18 +17,19 @@ class VGGBase(nn.Module):
         super(VGGBase, self).__init__()
 
         # Standard convolutional layers in VGG16
-        self.conv1_1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)  # stride = 1, by default
+        self.conv1_1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)  # stride = 1, by default
         self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
 
         self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
 
-        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)  # ceiling (not floor) here for even dims
+        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=3)
+        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=3)
+        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, padding=3)
+        # self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)  # ceiling (not floor) here for even dims
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
         self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
@@ -46,7 +47,7 @@ class VGGBase(nn.Module):
         self.conv7 = nn.Conv2d(1024, 1024, kernel_size=1)
 
         # Load pretrained layers
-        self.load_pretrained_layers()
+        # self.load_pretrained_layers()
 
     def forward(self, image):
         """
@@ -55,6 +56,8 @@ class VGGBase(nn.Module):
         :param image: images, a tensor of dimensions (N, 3, 300, 300)
         :return: lower-level feature maps conv4_3 and conv7
         """
+        # Rafacto note: shapes are not correct
+        # Code has been changed to match RD/RA dimension
         out = F.relu(self.conv1_1(image))  # (N, 64, 300, 300)
         out = F.relu(self.conv1_2(out))  # (N, 64, 300, 300)
         out = self.pool1(out)  # (N, 64, 150, 150)
@@ -62,7 +65,6 @@ class VGGBase(nn.Module):
         out = F.relu(self.conv2_1(out))  # (N, 128, 150, 150)
         out = F.relu(self.conv2_2(out))  # (N, 128, 150, 150)
         out = self.pool2(out)  # (N, 128, 75, 75)
-
         out = F.relu(self.conv3_1(out))  # (N, 256, 75, 75)
         out = F.relu(self.conv3_2(out))  # (N, 256, 75, 75)
         out = F.relu(self.conv3_3(out))  # (N, 256, 75, 75)
@@ -329,6 +331,7 @@ class SSD300(nn.Module):
         super(SSD300, self).__init__()
 
         self.n_classes = n_classes
+        # self.custom_pad = nn.ConstantPad2d(padding=(118, 118, 22, 22), value=0)
 
         self.base = VGGBase()
         self.aux_convs = AuxiliaryConvolutions()
@@ -349,6 +352,9 @@ class SSD300(nn.Module):
         :param image: images, a tensor of dimensions (N, 3, 300, 300)
         :return: 8732 locations and class scores (i.e. w.r.t each prior box) for each image
         """
+        # Deal with RD dimensions
+        # image = self.custom_pad(image)
+        
         # Run VGG base network convolutions (lower level feature map generators)
         conv4_3_feats, conv7_feats = self.base(image)  # (N, 512, 38, 38), (N, 1024, 19, 19)
 

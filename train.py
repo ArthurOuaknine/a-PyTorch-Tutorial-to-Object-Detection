@@ -1,26 +1,40 @@
+import os
 import time
 import torch.backends.cudnn as cudnn
 import torch.optim
-import torch.utils.data
+# import torch.utils.data
+from torch.utils.data import DataLoader
 from model import SSD300, MultiBoxLoss
 from datasets import PascalVOCDataset
 from utils import *
 
+from radar_utils import download, RADAR_HOME
+from radar_infrastructure.carrada.dataset import Carrada
+from radar_infrastructure.carrada.dataloaders import SequenceCarradaDataset, FrameCarradaDatasetBox
+
 # Data parameters
 data_folder = './'  # folder with data files
-keep_difficult = True  # use objects considered difficult to detect?
+keep_difficult = False  # use objects considered difficult to detect?
 
 # Model parameters
 # Not too many here since the SSD300 has a very specific structure
 n_classes = len(label_map)  # number of different types of objects
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Carrada stuffs
+signal_type = 'range_doppler'
+annot_type = 'box'
+annot_format = 'selected_light_frame'
+carrada_path = download('Carrada')
+config_path = os.path.join(RADAR_HOME, 'config.ini')
+
+
 # Learning parameters
 checkpoint = None  # path to model checkpoint, None if none
 batch_size = 8  # batch size
 iterations = 120000  # number of iterations to train
 workers = 4  # number of workers for loading data in the DataLoader
-print_freq = 200  # print training status every __ batches
+print_freq = 20  # print training status every __ batches
 lr = 1e-3  # learning rate
 decay_lr_at = [80000, 100000]  # decay learning rate after these many iterations
 decay_lr_to = 0.1  # decay learning rate to this fraction of the existing learning rate
@@ -65,36 +79,47 @@ def main():
     criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
 
     # Custom dataloaders
+    dataset = Carrada(config_path, annot_format=annot_format)
+    train_dataset = dataset.get('Train')
+    train_seq_loader = DataLoader(SequenceCarradaDataset(train_dataset), batch_size=1,
+                                  shuffle=True, num_workers=0)
+    """
     train_dataset = PascalVOCDataset(data_folder,
                                      split='train',
                                      keep_difficult=keep_difficult)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                                collate_fn=train_dataset.collate_fn, num_workers=workers,
                                                pin_memory=True)  # note that we're passing the collate function here
+    """
 
     # Calculate total number of epochs to train and the epochs to decay learning rate at (i.e. convert iterations to epochs)
     # To convert iterations to epochs, divide iterations by the number of iterations per epoch
     # The paper trains for 120,000 iterations with a batch size of 32, decays after 80,000 and 100,000 iterations
-    epochs = iterations // (len(train_dataset) // 32)
-    decay_lr_at = [it // (len(train_dataset) // 32) for it in decay_lr_at]
+    # epochs = iterations // (len(train_dataset) // 32)
+    # decay_lr_at = [it // (len(train_dataset) // 32) for it in decay_lr_at]
+    epochs = 100
+    decay_lr_at = 10
 
     # Epochs
     for epoch in range(start_epoch, epochs):
-
         # Decay learning rate at particular epochs
-        if epoch in decay_lr_at:
+        if epoch % decay_lr_at == 0 and epoch > 0:
             adjust_learning_rate(optimizer, decay_lr_to)
 
-        # One epoch's training
-        train(train_loader=train_loader,
+        train(train_loader=train_seq_loader,
               model=model,
               criterion=criterion,
               optimizer=optimizer,
               epoch=epoch)
-
+        import ipdb; ipdb.set_trace()
         # Save checkpoint
         save_checkpoint(epoch, model, optimizer)
 
+
+def _normalize(data):
+    min_value = torch.min(data)
+    max_value = torch.max(data)
+    return torch.div(torch.sub(data, min_value), torch.sub(max_value, min_value))
 
 def train(train_loader, model, criterion, optimizer, epoch):
     """
@@ -115,45 +140,55 @@ def train(train_loader, model, criterion, optimizer, epoch):
     start = time.time()
 
     # Batches
-    for i, (images, boxes, labels, _) in enumerate(train_loader):
-        data_time.update(time.time() - start)
+    iteration = 0 # To move for tensorboard
+    for j, seq_data in enumerate(train_loader):
+        seq_name, seq = seq_data
+        path_to_frames = os.path.join(carrada_path, seq_name[0])
+        frame_dataset = FrameCarradaDatasetBox(seq, annot_type, signal_type, path_to_frames)
+        train_frame_loader = DataLoader(frame_dataset, shuffle=False, batch_size=batch_size,
+                                        num_workers=workers)
 
-        # Move to default device
-        images = images.to(device)  # (batch_size (N), 3, 300, 300)
-        boxes = [b.to(device) for b in boxes]
-        labels = [l.to(device) for l in labels]
+        for i, (matrices, boxes, labels, _) in enumerate(train_frame_loader):
+            data_time.update(time.time() - start)
 
-        # Forward prop.
-        predicted_locs, predicted_scores = model(images)  # (N, 8732, 4), (N, 8732, n_classes)
+            # Move to default device
+            matrices = matrices.to(device, dtype=torch.float)  # (batch_size (N), 3, 300, 300)
+            matrices = _normalize(matrices)
+            boxes = [b.to(device) for b in boxes]
+            labels = [l.to(device) for l in labels]
 
-        # Loss
-        loss = criterion(predicted_locs, predicted_scores, boxes, labels)  # scalar
+            # Forward prop.
+            predicted_locs, predicted_scores = model(matrices)  # (N, 8732, 4), (N, 8732, n_classes)
 
-        # Backward prop.
-        optimizer.zero_grad()
-        loss.backward()
+            # Loss
+            loss = criterion(predicted_locs, predicted_scores, boxes, labels)  # scalar
 
-        # Clip gradients, if necessary
-        if grad_clip is not None:
-            clip_gradient(optimizer, grad_clip)
+            # Backward prop.
+            optimizer.zero_grad()
+            loss.backward()
 
-        # Update model
-        optimizer.step()
+            # Clip gradients, if necessary
+            if grad_clip is not None:
+                clip_gradient(optimizer, grad_clip)
 
-        losses.update(loss.item(), images.size(0))
-        batch_time.update(time.time() - start)
+            # Update model
+            optimizer.step()
 
-        start = time.time()
+            losses.update(loss.item(), matrices.size(0))
+            batch_time.update(time.time() - start)
 
-        # Print status
-        if i % print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Batch Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data Time {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, i, len(train_loader),
-                                                                  batch_time=batch_time,
-                                                                  data_time=data_time, loss=losses))
-    del predicted_locs, predicted_scores, images, boxes, labels  # free some memory since their histories may be stored
+            start = time.time()
+
+            # Print status
+            if i % print_freq == 0:
+                print('Epoch: [{0}][{1}]\t'
+                      'Batch Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data Time {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, iteration,
+                                                                      batch_time=batch_time,
+                                                                      data_time=data_time, loss=losses))
+            iteration += 1
+            del predicted_locs, predicted_scores, matrices, boxes, labels  # free some memory since their histories may be stored
 
 
 if __name__ == '__main__':
